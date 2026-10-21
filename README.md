@@ -1,465 +1,187 @@
-# API → PostgreSQL ETL Pipeline
+# StreamForge — API Ingestion & Data Processing
 
-Educational Data Engineering project for a Junior Data Engineer / Python ETL Developer portfolio.
+StreamForge is a Python-based ETL project that collects records from a public API, processes them through a PostgreSQL data workflow, and prepares reliable data for downstream use.
 
-This project implements a Python ETL pipeline that extracts user data from a public API, loads raw JSON into PostgreSQL staging, normalizes and validates records, stores rejected rows with error details, deduplicates valid data, and performs an idempotent final load with audit logging.
+The implementation focuses on the practical challenges of ingestion pipelines: inconsistent input, invalid fields, repeated records, database transaction safety, and predictable results across repeated executions.
 
-## Project Overview
+## 1. Project Overview
 
-The pipeline demonstrates a small but realistic ETL flow:
+The pipeline takes external user data through a series of processing stages, preserving the original input while separating valid records from rejected ones.
 
-```text
-External API
-   ↓
-Controlled dirty and duplicate records
-   ↓
-PostgreSQL staging
-   ↓
-Normalization
-   ↓
-Pydantic validation
-   ↓
-clean_users / rejected_users
-   ↓
-Deduplication
-   ↓
-final_users
-   ↓
-etl_load_logs
-```
+Its main capabilities include:
 
-The main goal of the project is to show practical Data Engineering skills:
+- Retrieving records from an external REST API.
+- Persisting incoming JSON payloads in PostgreSQL.
+- Converting nested attributes into a consistent structure.
+- Applying Pydantic models to validate field values.
+- Recording invalid records alongside their validation errors.
+- Removing duplicate records using a deterministic selection rule.
+- Synchronizing processed records into a final database table.
+- Recording execution statistics and failure details.
+- Testing transformation logic and database-dependent behavior with pytest.
 
-- API extraction
-- PostgreSQL staging layer
-- data normalization
-- data validation with Pydantic
-- clean / rejected records flow
-- rejected records with error details
-- deduplication by business key
-- idempotent final loading
-- audit logging
-- failed-run logging
-- transaction-safe database loading
-- Dockerized PostgreSQL
-- Airflow DAG basics
-- unit and integration testing with pytest
+## 2. Architecture
 
-## Tech Stack
-
-- Python
-- PostgreSQL
-- Docker / Docker Compose
-- requests
-- psycopg2
-- Pydantic
-- pytest
-- Apache Airflow DAG basics
-
-## Data Source
-
-The pipeline extracts users from:
+The processing workflow follows this sequence:
 
 ```text
-https://jsonplaceholder.typicode.com/users
+Public REST API
+      |
+      v
+Input Preparation
+      |
+      v
+Raw PostgreSQL Staging
+      |
+      v
+Normalization and Validation
+      |
+      +--------------------+
+      |                    |
+      v                    v
+  Valid Data          Rejected Data
+      |
+      v
+Duplicate Resolution
+      |
+      v
+Final User Table
+      |
+      v
+Execution Audit
 ```
 
-The source API returns 10 user records.
+The database tables have distinct responsibilities:
 
-For demonstration purposes, the project intentionally adds:
+| Table | Purpose |
+|---|---|
+| `stg_users_raw` | Retains the original incoming records. |
+| `clean_users` | Holds normalized records that pass validation. |
+| `rejected_users` | Captures invalid input and associated error information. |
+| `final_users` | Stores the deduplicated output dataset. |
+| `etl_load_logs` | Tracks pipeline execution status and processing counters. |
 
-- 5 controlled dirty records to test validation and rejected flow;
-- 2 controlled duplicate records to test deduplication.
+## 3. Tools and Libraries
 
-Expected input size after demo-data injection:
+- **Python** — pipeline implementation and orchestration logic.
+- **PostgreSQL** — persistent storage and relational data processing.
+- **Docker Compose** — local database environment.
+- **Requests** — HTTP communication with the source API.
+- **Psycopg2** — PostgreSQL connectivity.
+- **Pydantic** — structured data validation.
+- **Pytest** — automated unit and integration tests.
+- **Apache Airflow** — DAG implementation for orchestration integration.
+
+## 4. Source Data
+
+The pipeline retrieves sample user records from JSONPlaceholder:
+
+`https://jsonplaceholder.typicode.com/users`
+
+The API supplies 10 users. Additional records are introduced deliberately to exercise validation and duplicate-handling logic.
+
+| Input category | Records |
+|---|---:|
+| Original API response | 10 |
+| Intentionally invalid records | 5 |
+| Additional duplicate records | 2 |
+| **Total input** | **17** |
+
+These controlled inputs make it possible to reproduce expected processing outcomes without depending on naturally occurring data errors.
+
+## 5. Processing Stages
+
+### Stage 1 — API extraction
+
+The extraction module requests the source data and passes the returned records into the pipeline.
+
+### Stage 2 — Raw ingestion
+
+All 17 prepared records are written to `stg_users_raw` as JSON. Retaining the original payload allows later investigation without depending exclusively on transformed values.
+
+### Stage 3 — Standardization
+
+The normalization module flattens nested attributes and converts them into the structure expected by the downstream model. For example, the API's company information is represented through a `company_name` field.
+
+### Stage 4 — Validation and rejection handling
+
+Pydantic checks whether records conform to the defined data model.
+
+- Records that pass validation continue through the clean-data path.
+- Records that fail validation are stored in `rejected_users`.
+- Validation errors identify the affected fields and explain why a record was rejected.
+
+Both clean and rejected records are written within one database transaction, so a loading error can roll back the complete operation.
+
+### Stage 5 — Duplicate resolution
+
+Valid records are deduplicated using `external_id` as the business key.
+
+Because the source API does not provide an `updated_at` attribute, the current implementation keeps the record with the highest `staging_id` for each key. This is a deterministic demonstration rule rather than a guarantee that the selected record is the most recent in the source system.
+
+### Stage 6 — Final synchronization
+
+The selected records are loaded into `final_users`. The loader distinguishes between three outcomes:
+
+- **Inserted:** the key is not present in the destination.
+- **Updated:** the key exists, but its stored values differ.
+- **Unchanged:** the destination already contains the same values.
+
+The `external_id` column is unique in the final table, preventing duplicate business keys in the published dataset.
+
+### Stage 7 — Execution tracking
+
+Each run writes its status and processing counters to `etl_load_logs`. Failed executions can also record the stage at which processing stopped and the associated error message.
+
+## 6. Database Transactions and Repeatability
+
+Database operations use a shared connection and cursor management utility. Successful operations are committed, exceptions trigger rollback, and database resources are closed after use.
+
+The clean/rejected loading step is atomic: either both result sets are persisted, or neither is.
+
+The final loader is designed to support repeatable execution. When the same data is processed again without any changes, the expected counters are:
 
 ```text
-10 API records
-+ 5 dirty records
-+ 2 duplicate records
-= 17 total records
-```
-
-## ETL Flow
-
-### 1. Extract
-
-The pipeline requests user data from the public API.
-
-### 2. Prepare demo data
-
-Controlled dirty and duplicate records are added intentionally.
-
-This makes the project easier to test and explain because the pipeline always receives a predictable mix of:
-
-- valid records;
-- invalid records;
-- duplicate records.
-
-### 3. Load raw data into staging
-
-All input records are loaded into `stg_users_raw` as raw JSON.
-
-This preserves the original source data before any validation or transformation.
-
-### 4. Normalize records
-
-Nested API fields are flattened and converted into a simpler structure.
-
-For example, company data from the API is normalized into:
-
-```text
-company_name
-```
-
-### 5. Validate records
-
-Records are validated with Pydantic.
-
-Valid records go to the clean flow.
-
-Invalid records go to the rejected flow with detailed validation errors.
-
-### 6. Load clean and rejected records
-
-Clean and rejected records are loaded in one database transaction.
-
-This means:
-
-```text
-clean insert + rejected insert → one commit
-any error → one rollback
-```
-
-This prevents partial validation results for the same `run_id`.
-
-### 7. Deduplicate clean records
-
-The project deduplicates valid records by business key:
-
-```text
-external_id
-```
-
-The source API does not provide an `updated_at` field, so the project uses a deterministic educational rule:
-
-```text
-For each external_id, keep the record with the maximum staging_id.
-```
-
-### 8. Load final users
-
-Final deduplicated records are loaded into `final_users`.
-
-The final load is idempotent:
-
-- new records are inserted;
-- changed records are updated;
-- unchanged records are left untouched.
-
-### 9. Write audit log
-
-Each pipeline run is logged in `etl_load_logs`.
-
-The log stores:
-
-- run status;
-- row counters;
-- failed step;
-- error message;
-- start and finish timestamps.
-
-## Database Schema
-
-### `etl_load_logs`
-
-Stores one row per pipeline run.
-
-Main fields:
-
-- `run_id`
-- `source`
-- `status`
-- `started_at`
-- `finished_at`
-- `rows_received`
-- `rows_staged`
-- `rows_clean`
-- `rows_rejected`
-- `rows_deduplicated`
-- `rows_final_candidates`
-- `rows_inserted`
-- `rows_updated`
-- `rows_unchanged`
-- `failed_step`
-- `error_message`
-
-Supported statuses:
-
-```text
-running
-success
-failed
-partial_success
-```
-
-### `stg_users_raw`
-
-Stores all raw input records before validation.
-
-This table contains:
-
-- original API records;
-- intentionally injected dirty records;
-- intentionally injected duplicate records.
-
-### `clean_users`
-
-Stores normalized and valid records before deduplication.
-
-`external_id` is not unique in this table because duplicates are allowed before the deduplication step.
-
-### `rejected_users`
-
-Stores invalid records with validation error details.
-
-Main fields:
-
-- `run_id`
-- `staging_id`
-- `raw_record`
-- `error_details`
-
-Example `error_details`:
-
-```json
-[
-  {
-    "field": "external_id",
-    "reason": "Input should be a valid integer"
-  },
-  {
-    "field": "name",
-    "reason": "name must not be empty"
-  },
-  {
-    "field": "email",
-    "reason": "value is not a valid email address"
-  }
-]
-```
-
-### `final_users`
-
-Stores final deduplicated user records.
-
-`external_id` is unique in this table.
-
-The final loader supports:
-
-- insert new records;
-- update changed records;
-- skip unchanged records.
-
-## Transaction Handling
-
-Database operations use a shared cursor context manager.
-
-The context manager:
-
-- opens a PostgreSQL connection;
-- opens a cursor;
-- commits the transaction on success;
-- rolls back the transaction on error;
-- always closes the cursor and connection.
-
-This reduces duplicated database handling code and makes ETL loading safer.
-
-Clean and rejected records are loaded atomically in one transaction:
-
-```text
-load clean records
-load rejected records
-commit once
-```
-
-If either part fails, the full transaction is rolled back.
-
-## Idempotency
-
-The final load is idempotent.
-
-When the same final data is loaded again, the expected result is:
-
-```text
-rows_inserted = 0
-rows_updated = 0
+rows_inserted  = 0
+rows_updated   = 0
 rows_unchanged = 10
 ```
 
-This means repeated pipeline runs do not create duplicate rows and do not update unchanged data.
+This behavior prevents repeated executions from creating additional final records for existing business keys.
 
-## Airflow Status
+## 7. Local Setup
 
-The project includes an Airflow DAG:
+### Prerequisites
 
-```text
-dags/users_etl_dag.py
-```
+Install Python, Docker Desktop, and Git before starting.
 
-The DAG calls:
+### Create the Python environment
 
-```text
-run_users_pipeline()
-```
-
-from:
-
-```text
-src/pipeline.py
-```
-
-Current Airflow status:
-
-```text
-Airflow DAG is implemented.
-Full Airflow Docker runtime is not included yet.
-```
-
-The ETL business logic stays inside `src/`.
-
-Airflow is used only as an orchestration entry point:
-
-```text
-Airflow DAG
-   ↓
-Python task
-   ↓
-run_users_pipeline()
-```
-
-The current `docker-compose.yml` runs PostgreSQL only.
-
-The pipeline is executed locally with:
-
-```bash
-python -m src.pipeline
-```
-
-### Why Airflow is not included in `requirements.txt`
-
-`apache-airflow` is intentionally not included in the main `requirements.txt` because Airflow is a heavy orchestration platform with its own runtime, scheduler, metadata database, web interface, and dependency constraints.
-
-The current project demonstrates Airflow DAG basics without adding a full Airflow deployment.
-
-Future improvement:
-
-```text
-Add full Airflow runtime through Docker Compose.
-```
-
-## Project Structure
-
-```text
-api-airflow-postgres-etl-pipeline/
-│
-├── dags/
-│   └── users_etl_dag.py
-│
-├── sql/
-│   ├── 001_create_tables.sql
-│   └── 002_create_indexes.sql
-│
-├── src/
-│   ├── extract/
-│   │   └── users_api.py
-│   │
-│   ├── load/
-│   │   ├── clean_rejected_loader.py
-│   │   ├── final_loader.py
-│   │   └── staging_loader.py
-│   │
-│   ├── normalize/
-│   │   └── users_normalizer.py
-│   │
-│   ├── transform/
-│   │   ├── demo_data.py
-│   │   └── users_deduplication.py
-│   │
-│   ├── utils/
-│   │   ├── db.py
-│   │   ├── logger.py
-│   │   ├── run_id.py
-│   │   └── settings.py
-│   │
-│   ├── validate/
-│   │   ├── users_model.py
-│   │   └── users_validator.py
-│   │
-│   └── pipeline.py
-│
-├── tests/
-│   ├── test_deduplication.py
-│   ├── test_idempotency.py
-│   ├── test_normalization.py
-│   ├── test_rejected.py
-│   └── test_validation.py
-│
-├── docker-compose.yml
-├── pytest.ini
-├── requirements.txt
-├── .env.example
-└── README.md
-```
-
-## Setup
-
-### 1. Clone repository
-
-```bash
-git clone <repository-url>
-cd api-airflow-postgres-etl-pipeline
-```
-
-### 2. Create virtual environment
-
-Windows PowerShell:
+On Windows PowerShell:
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
 ```
 
-Bash:
+On macOS or Linux:
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-```
-
-### 3. Install dependencies
-
-```bash
 python -m pip install -r requirements.txt
 ```
 
-### 4. Create `.env`
+### Configure environment variables
 
-Copy the example file:
-
-Windows PowerShell:
+Create a local `.env` file from `.env.example`.
 
 ```powershell
 Copy-Item .env.example .env
 ```
 
-Bash:
-
-```bash
-cp .env.example .env
-```
-
-For local Python execution with PostgreSQL running through Docker Compose, use:
+Configure the database connection and source URL:
 
 ```env
 POSTGRES_DB=etl_db
@@ -471,81 +193,56 @@ POSTGRES_PORT=5433
 API_URL=https://jsonplaceholder.typicode.com/users
 ```
 
-The Docker container maps PostgreSQL like this:
+Use the database credentials defined by your local Compose configuration.
 
-```text
-localhost:5433 → postgres container:5432
-```
-
-## Docker Usage
-
-Start PostgreSQL:
+### Start PostgreSQL
 
 ```bash
 docker compose up -d
-```
-
-Check container status:
-
-```bash
 docker compose ps
 ```
 
-Expected service:
+The existing configuration exposes PostgreSQL on host port `5433`, forwarding connections to container port `5432`.
 
-```text
-users_etl_postgres
-```
+### Initialize database objects
 
-## Create Tables
-
-PowerShell:
+Run these commands in PowerShell:
 
 ```powershell
 Get-Content sql\001_create_tables.sql | docker exec -i users_etl_postgres psql -U etl_user -d etl_db
 ```
 
-Bash:
-
-```bash
-cat sql/001_create_tables.sql | docker exec -i users_etl_postgres psql -U etl_user -d etl_db
-```
-
-## Create Indexes
-
-PowerShell:
-
 ```powershell
 Get-Content sql\002_create_indexes.sql | docker exec -i users_etl_postgres psql -U etl_user -d etl_db
 ```
 
-Bash:
+These scripts create the database tables and indexes used by the pipeline.
 
-```bash
-cat sql/002_create_indexes.sql | docker exec -i users_etl_postgres psql -U etl_user -d etl_db
-```
+## 8. Execute the Pipeline
 
-## Run Pipeline
+From the repository root, run:
 
 ```bash
 python -m src.pipeline
 ```
 
-Expected output:
+A successful execution prints a message similar to:
 
 ```text
 Pipeline finished successfully. run_id=<uuid>
 ```
 
-## Check Latest Run Log
+The run identifier can be used to investigate the corresponding execution and its database results.
 
-Open PostgreSQL:
+### Inspect the latest execution
+
+Connect to PostgreSQL:
 
 ```bash
 docker exec -it users_etl_postgres psql -U etl_user -d etl_db
 ```
 
-Run:
+Then query the audit table:
 
 ```sql
 SELECT
@@ -566,147 +263,127 @@ ORDER BY started_at DESC
 LIMIT 1;
 ```
 
-Expected successful run:
+For a successful first run with the supplied demonstration inputs, the expected processing counts are:
 
-```text
-status = success
-rows_received = 17
-rows_staged = 17
-rows_clean = 12
-rows_rejected = 5
-rows_deduplicated = 2
-rows_final_candidates = 10
-failed_step = null
-error_message = null
-```
+| Counter | Expected value |
+|---|---:|
+| Records received | 17 |
+| Records staged | 17 |
+| Valid records before deduplication | 12 |
+| Rejected records | 5 |
+| Duplicate records removed | 2 |
+| Final candidate records | 10 |
 
-If `final_users` already contains the same final data, expected final counters are:
+If those same ten final records are already present and unchanged, the subsequent run should report zero inserts, zero updates, and ten unchanged records.
 
-```text
-rows_inserted = 0
-rows_updated = 0
-rows_unchanged = 10
-```
+## 9. Automated Testing
 
-## Run Tests
+The repository uses pytest to check the transformation logic and database interactions.
 
-Run all tests:
+Run the complete test suite:
 
 ```bash
 python -m pytest
 ```
 
-Expected result:
-
-```text
-17 passed
-```
-
-Run only integration tests:
+Run only database integration tests:
 
 ```bash
 python -m pytest -m integration
 ```
 
-Expected result:
-
-```text
-2 passed
-```
-
-Run only unit tests:
+Run the unit tests:
 
 ```bash
 python -m pytest -m "not integration"
 ```
 
-Expected result:
+The documented test suite contains 17 tests: 15 unit tests and two integration tests.
+
+Unit tests cover normalization, validation, rejected records, and duplicate handling. Integration tests exercise the final loader's insert, update, unchanged, and idempotency behavior. PostgreSQL must be available for the integration tests.
+
+## 10. Airflow Integration
+
+The repository contains an Airflow DAG at:
+
+`dags/users_etl_dag.py`
+
+The DAG invokes `run_users_pipeline()` from `src/pipeline.py`, keeping the processing logic separate from the orchestration layer.
+
+The current setup includes the DAG definition but does not deploy a complete Airflow environment. Docker Compose is configured for PostgreSQL only, and the pipeline can be run directly through Python.
+
+A full Airflow deployment with a scheduler, web interface, and supporting services remains a possible extension.
+
+## 11. Repository Layout
 
 ```text
-15 passed
+api-airflow-postgres-etl-pipeline/
+├── dags/
+│   └── users_etl_dag.py
+├── sql/
+│   ├── 001_create_tables.sql
+│   └── 002_create_indexes.sql
+├── src/
+│   ├── extract/
+│   │   └── users_api.py
+│   ├── load/
+│   │   ├── clean_rejected_loader.py
+│   │   ├── final_loader.py
+│   │   └── staging_loader.py
+│   ├── normalize/
+│   │   └── users_normalizer.py
+│   ├── transform/
+│   │   ├── demo_data.py
+│   │   └── users_deduplication.py
+│   ├── utils/
+│   │   ├── db.py
+│   │   ├── logger.py
+│   │   ├── run_id.py
+│   │   └── settings.py
+│   ├── validate/
+│   │   ├── users_model.py
+│   │   └── users_validator.py
+│   └── pipeline.py
+├── tests/
+│   ├── test_deduplication.py
+│   ├── test_idempotency.py
+│   ├── test_normalization.py
+│   ├── test_rejected.py
+│   └── test_validation.py
+├── docker-compose.yml
+├── pytest.ini
+├── requirements.txt
+├── .env.example
+└── README.md
 ```
 
-## Test Structure
+## 12. Engineering Highlights
 
-Unit tests cover pure Python logic:
+StreamForge demonstrates several useful data engineering practices:
 
-- normalization;
-- validation;
-- rejected records flow;
-- deduplication.
+- Separating extraction, transformation, validation, and loading responsibilities.
+- Retaining raw input for traceability.
+- Isolating invalid records instead of silently discarding them.
+- Applying deterministic deduplication rules.
+- Using transaction boundaries to avoid partially written validation results.
+- Distinguishing inserted, modified, and unchanged destination records.
+- Capturing execution metadata for debugging and auditing.
+- Testing Python transformations separately from database-dependent behavior.
+- Keeping orchestration code separate from the ETL implementation.
 
-Integration tests require PostgreSQL and cover database-dependent behavior:
+## 13. Current Scope and Future Work
 
-- final loader idempotency;
-- insert / update / unchanged behavior.
+The current implementation is an educational portfolio project rather than a fully deployed production service.
 
-The integration tests are marked with:
+Potential extensions include:
 
-```python
-pytestmark = pytest.mark.integration
-```
+- Deploying Airflow alongside PostgreSQL through Docker Compose.
+- Automating SQL schema changes with a migration tool.
+- Adding retry and timeout policies for API requests.
+- Introducing automated tests through a GitHub Actions workflow.
+- Supporting additional API sources and configurable validation rules.
+- Improving monitoring and structured failure reporting.
 
-## Example Final Technical Check
+## License
 
-A successful final project check produced:
-
-```text
-17 passed
-Pipeline finished successfully
-```
-
-Latest `etl_load_logs` result:
-
-```text
-status = success
-rows_received = 17
-rows_staged = 17
-rows_clean = 12
-rows_rejected = 5
-rows_deduplicated = 2
-rows_final_candidates = 10
-rows_inserted = 0
-rows_updated = 0
-rows_unchanged = 10
-```
-
-This confirms that the pipeline is working and the final load is idempotent.
-
-## Current Limitations
-
-- Full Airflow Docker runtime is not included yet.
-- PostgreSQL migrations are executed manually through SQL files.
-- Demo dirty and duplicate records are intentionally injected for educational purposes.
-- The final loader uses explicit `SELECT / INSERT / UPDATE` logic instead of compact PostgreSQL `ON CONFLICT`.
-- The project is designed as an educational portfolio project, not as a production deployment.
-
-## Future Improvements
-
-Possible improvements:
-
-- dockerize the Python pipeline runtime and add a pipeline service to `docker-compose.yml`;
-- add full Airflow Docker Compose runtime;
-- add migration tooling;
-- replace explicit final load logic with PostgreSQL `ON CONFLICT`;
-- add CI workflow for automated tests;
-- add more API sources;
-- add more data quality checks;
-- add retry logic for API extraction;
-- add structured application logging.
-
-## What This Project Demonstrates
-
-This project demonstrates practical Junior Data Engineer skills:
-
-- building an API-to-PostgreSQL ETL pipeline;
-- designing staging, clean, rejected and final layers;
-- validating data with Pydantic;
-- storing rejected records with detailed errors;
-- implementing deterministic deduplication;
-- building idempotent final loading;
-- using PostgreSQL constraints and indexes;
-- managing database transactions safely;
-- logging successful and failed pipeline runs;
-- running PostgreSQL with Docker Compose;
-- separating unit and integration tests;
-- preparing an Airflow DAG as an orchestration entry point.
+MIT
